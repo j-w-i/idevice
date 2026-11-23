@@ -53,6 +53,10 @@ pub mod tunnel;
 #[cfg(feature = "xpc")]
 pub use xpc::RemoteXpcClient;
 
+/// Lockdown sessions with devices below this major iOS version use legacy TLS
+/// settings (SSLv3/TLS 1.0), which rustls does not support.
+pub const LEGACY_TLS_MAX_MAJOR: u8 = 9;
+
 use plist_macro::{plist, pretty_print_dictionary, pretty_print_plist};
 use provider::{IdeviceProvider, RsdProvider};
 #[cfg(feature = "rustls")]
@@ -677,9 +681,15 @@ impl Idevice {
     ) -> Result<(), IdeviceError> {
         #[cfg(feature = "rustls")]
         {
+            #[cfg(feature = "openssl")]
+            if legacy {
+                return self.start_legacy_openssl_session(pairing_file).await;
+            }
+
+            #[cfg(not(feature = "openssl"))]
             if legacy {
                 tracing::warn!(
-                    "Compiled with rustls, but connecting to legacy device! rustls does not support old SSL, this will fail."
+                    "Compiled with rustls, but connecting to legacy device! rustls does not support old SSL, this will fail. Enable the openssl feature to support legacy devices."
                 );
             }
 
@@ -719,6 +729,65 @@ impl Idevice {
 
             Ok(())
         }
+    }
+}
+
+/// With both `rustls` and `openssl` enabled, legacy devices use OpenSSL for the
+/// session handshake while everything else stays on rustls.
+#[cfg(all(feature = "rustls", feature = "openssl"))]
+impl Idevice {
+    async fn start_legacy_openssl_session(
+        &mut self,
+        pairing_file: &pairing_file::PairingFile,
+    ) -> Result<(), IdeviceError> {
+        use openssl::{pkey::PKey, ssl, x509::X509};
+
+        let setup_err =
+            |e: openssl::error::ErrorStack| IdeviceError::LegacyTls(format!("setup failed: {e}"));
+
+        debug!("Using OpenSSL for legacy device TLS session");
+        let mut builder = ssl::SslConnector::builder(ssl::SslMethod::tls()).map_err(setup_err)?;
+        // SSLv3 is not available in OpenSSL 4+, so fall back to TLS 1.0 as the floor.
+        if builder
+            .set_min_proto_version(Some(ssl::SslVersion::SSL3))
+            .is_err()
+        {
+            builder
+                .set_min_proto_version(Some(ssl::SslVersion::TLS1))
+                .map_err(setup_err)?;
+        }
+        builder
+            .set_max_proto_version(Some(ssl::SslVersion::TLS1))
+            .map_err(setup_err)?;
+        builder
+            .set_cipher_list("ALL:!aNULL:!eNULL:@SECLEVEL=0")
+            .map_err(setup_err)?;
+        builder.set_options(ssl::SslOptions::ALLOW_UNSAFE_LEGACY_RENEGOTIATION);
+
+        let mut connection = builder
+            .build()
+            .configure()
+            .map_err(setup_err)?
+            .into_ssl("Device")
+            .map_err(setup_err)?;
+
+        let cert = X509::from_der(pairing_file.host_certificate.as_ref()).map_err(setup_err)?;
+        let key = PKey::private_key_from_pem(&pairing_file.host_private_key).map_err(setup_err)?;
+        connection.set_certificate(&cert).map_err(setup_err)?;
+        connection.set_private_key(&key).map_err(setup_err)?;
+        connection.set_verify(ssl::SslVerifyMode::NONE);
+
+        let socket = self
+            .socket
+            .take()
+            .ok_or(IdeviceError::NoEstablishedConnection)?;
+        let mut stream = tokio_openssl::SslStream::new(connection, socket).map_err(setup_err)?;
+        std::pin::Pin::new(&mut stream)
+            .connect()
+            .await
+            .map_err(|e| IdeviceError::LegacyTls(format!("handshake failed: {e}")))?;
+        self.socket = Some(Box::new(stream));
+        Ok(())
     }
 }
 
@@ -782,6 +851,9 @@ pub enum IdeviceError {
     #[cfg(feature = "rustls")]
     #[error("TLS verification build failed")]
     TlsBuilderFailed(#[from] rustls::server::VerifierBuilderError),
+    #[cfg(all(feature = "rustls", feature = "openssl"))]
+    #[error("legacy TLS error: {0}")]
+    LegacyTls(String),
     #[cfg(all(feature = "openssl", not(feature = "rustls")))]
     #[error("TLS verification build failed")]
     TlsBuilderFailed(#[from] openssl::error::ErrorStack),
@@ -1003,6 +1075,8 @@ impl IdeviceError {
             IdeviceError::Rustls(_) => 3,
             #[cfg(any(feature = "rustls", feature = "openssl"))]
             IdeviceError::TlsBuilderFailed(_) => 4,
+            #[cfg(all(feature = "rustls", feature = "openssl"))]
+            IdeviceError::LegacyTls(_) => 3,
             IdeviceError::Timeout => 109,
 
             // 5: Data format

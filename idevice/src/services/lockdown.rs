@@ -237,7 +237,7 @@ impl LockdownClient {
     ///
     /// # Returns
     /// `Ok(legacy)` on successful session establishment, where `legacy` indicates
-    /// whether the device is running iOS < 5 and requires legacy TLS settings
+    /// whether the device is older than [`crate::LEGACY_TLS_MAX_MAJOR`] and requires legacy TLS settings
     ///
     /// # Errors
     /// Returns `IdeviceError` if:
@@ -260,7 +260,7 @@ impl LockdownClient {
             .and_then(|x| x.as_string())
             .and_then(|x| x.split(".").next())
             .and_then(|x| x.parse::<u8>().ok())
-            .map(|x| x < 5)
+            .map(|x| x < crate::LEGACY_TLS_MAX_MAJOR)
             .unwrap_or(false);
 
         let request = crate::plist!({
